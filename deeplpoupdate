@@ -1,0 +1,254 @@
+#! /usr/bin/python3
+# Copyright 2023 Akretion France <https://www.akretion.com/>
+
+import argparse
+import polib
+import subprocess
+import deepl
+import re
+import logging
+import sys
+import pathlib
+import requests
+import csv
+from os.path import isfile
+
+__author__ = "Alexis de Lattre <alexis.delattre@akretion.com>"
+__date__ = "June 2023"
+__version__ = "0.1"
+
+logger = logging.getLogger(__name__)
+FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
+logging.basicConfig(format=FORMAT)
+
+DEEPL_GLOSSARY_NAME = 'odoo_fr_glossary'
+GDOC_URL = "https://docs.google.com/spreadsheets/d/1EacGeRFECVt6v9B4H7l5EUEDjefNeyGRicqouJ6P5mM/export"
+TM_TAB = 0
+GLOSSARY_TAB = 2121742205
+# We use a very small NO_TRANSLATE_TAG to save money
+# because Deepl counts it in the char count !
+NO_TRANSLATE_TAG = 'z'
+
+
+def _get_google_doc_dict(url, tab, lang_from, lang_to):
+    logger.debug('Downloading Google doc %s tab %s', url, tab)
+    params = {'format': 'csv', 'gid': tab}
+    r = requests.get(url, params=params)
+    if r.status_code not in (200, 201):
+        logger.error(
+            'GET request on %s with params %s returned HTTP error code %s',
+            url, params, r.status_code)
+        sys.exit(1)
+    csvcontent = r.content
+    csvstr = csvcontent.decode('utf8')
+    res = {}
+    for item in csv.DictReader(csvstr.splitlines()):
+        if item and item.get(lang_from) and item.get(lang_to):
+            from_str = item[lang_from].strip()
+            to_str = item[lang_to].strip()
+            if from_str and to_str:
+                res[from_str] = to_str
+    logger.debug('res=%s', res)
+    return res
+
+
+def set_deepl_glossary(lang_from, lang_to, translator):
+    logger.info('Downloading Glossary Google doc')
+    glossary = _get_google_doc_dict(GDOC_URL, GLOSSARY_TAB, lang_from, lang_to)
+    if not glossary:
+        logger.error('Failed to parse the glossary tab of the Google doc')
+        sys.exit(1)
+    logger.info('Creating deepl glossary...')
+    res = translator.create_glossary(
+        DEEPL_GLOSSARY_NAME,
+        source_lang=lang_from,
+        target_lang=lang_to,
+        entries=glossary)
+    logger.debug('Deepl glossary successfully created ID %s', res.glossary_id)
+    return res
+
+
+def get_deepl_glossary_object(translator):
+    logger.info('Listing Deepl glossaries...')
+    glossaries = translator.list_glossaries()
+    res = False
+    for glossary in glossaries:
+        if glossary.name == DEEPL_GLOSSARY_NAME:
+            if res:
+                logger.warning(
+                    'The glossary %s is not unique. Deleting the extra glossary ID %s',
+                    DEEPL_GLOSSARY_NAME, glossary.glossary_id)
+                translator.delete_glossary(glossary)
+            else:
+                res = glossary
+                logger.info(
+                    'Found glossary %s ID %s', DEEPL_GLOSSARY_NAME, res.glossary_id)
+    if not res:
+        logger.info('No glossary %s found', DEEPL_GLOSSARY_NAME)
+    return res
+
+
+def get_translation_memory_dict(lang_from, lang_to):
+    logger.info('Downloading Translation Memory Google doc')
+    tmmap = _get_google_doc_dict(GDOC_URL, TM_TAB, lang_from, lang_to)
+    if not tmmap:
+        logger.error('Failed to parse Translation Memory Google doc')
+        sys.exit(1)
+    return tmmap
+
+
+def insert_keep(matchobj):
+    return '<%s>%s</%s>' % (NO_TRANSLATE_TAG, matchobj.group(0), NO_TRANSLATE_TAG)
+
+
+def get_deepl_api_key():
+    api_key_path = "%s/.deepl_api_key.dat" % pathlib.Path.home()
+    if not isfile(api_key_path):
+        logger.error('DeepL API key file not found: %s', api_key_path)
+        sys.exit(1)
+    api_key = False
+    with open(api_key_path, "r") as api_key_file:
+        api_key = api_key_file.read()
+    logger.debug('api_key=%s', api_key)
+    return api_key
+
+
+def main(args):
+
+    if args.log_level:
+        log_level = args.log_level.lower()
+        log_map = {
+            'debug': logging.DEBUG,
+            'info': logging.INFO,
+            'warn': logging.WARN,
+            'error': logging.ERROR,
+        }
+        if log_level in log_map:
+            logger.setLevel(log_map[log_level])
+        else:
+            logger.error(
+                'Wrong value for log level (%s). Possible values: %s',
+                log_level, ', '.join(log_map.keys()))
+            sys.exit(1)
+
+    pofile = args.pofile
+    if not isfile(pofile):
+        logger.error('File not found: %s', pofile)
+        sys.exit(1)
+    logger.info('Starting to update %s', pofile)
+    translator = deepl.Translator(get_deepl_api_key())
+    pofileobj = polib.pofile(args.pofile)
+    lang_from = args.lang_from.upper()
+    lang_to = args.lang_to.upper()
+
+    glo_obj = get_deepl_glossary_object(translator)
+    if glo_obj and args.glossary_refresh:
+        logger.info(
+            'Deleting glossary %s ID %s', DEEPL_GLOSSARY_NAME, glo_obj.glossary_id)
+        translator.delete_glossary(glo_obj)
+        glo_obj = False
+    if not glo_obj:
+        glo_obj = set_deepl_glossary(lang_from, lang_to, translator)
+    # check glossary is ready
+    if glo_obj.ready:
+        logger.info('Glossary is in ready state')
+    else:
+        logger.error(
+            'Glossary %s ID %s is not ready', DEEPL_GLOSSARY_NAME, glo_obj.glossary_id)
+        logger.error('This rarely happens. Try again in a few minutes.')
+        # If we see it happen, we should add a while loop with a sleep+refresh
+        # to wait until it becomes ready
+        sys.exit(1)
+    deepl_char_count = 0
+
+    tmmap = get_translation_memory_dict(lang_from, lang_to)
+    for entry in pofileobj:
+        logger.debug('msgid=%s msgstr=%s', entry.msgid, entry.msgstr)
+        if entry.msgid in tmmap:
+            msgstr = tmmap[entry.msgid]
+            logger.info('Translation memory: %s -> %s', entry.msgid, msgstr)
+            entry.msgstr = tmmap[entry.msgid]
+        elif not entry.msgstr:
+            logger.info("Deepl request")
+            # preserve_formatting is False by default -> set it to True
+            # It will still update the formatting for punctuation
+            tag_handling = 'xml'
+            if entry.occurrences:
+                logger.debug('entry.occurrences=%s', entry.occurrences)
+                reference = False
+                # It's unclear to me when we get a tuple or directly a string
+                if isinstance(entry.occurrences[0], tuple):
+                    reference = entry.occurrences[0][0]
+                elif isinstance(entry.occurrences[0], str):
+                    reference = entry.occurrences[0]
+                if reference and reference.startswith('model:mail.template,body_html'):
+                    tag_handling = 'html'
+                    break
+            # To avoid translating %(company)s, we encapsulate with <keep>
+            pattern = r'%(\(\w*?\))?[sd]'
+            source_deepl_str = re.sub(pattern, insert_keep, entry.msgid)
+            logger.debug('Source string sent to deepl: %s', source_deepl_str)
+            # https://support.deepl.com/hc/en-us/articles/360020685720-DeepL-API-Character-count-and-billing
+            # One character corresponds to one unicode code point
+            # Invisible characters such as spaces, tabs, line feeds, etc.,
+            # The also count the no translate tag: the tag itself and its content!
+            # also count as characters.
+            src_char_count = len(source_deepl_str)
+            logger.debug('src_char_count=%d', src_char_count)
+            deepl_char_count += src_char_count
+            deepl_res_str = str(translator.translate_text(
+                source_deepl_str,
+                source_lang=lang_from,
+                target_lang=lang_to,
+                tag_handling=tag_handling,
+                glossary=glo_obj,
+                preserve_formatting=True,
+                ignore_tags=NO_TRANSLATE_TAG))
+            logger.debug('string returned by deepl: %s', deepl_res_str)
+            translated_str = deepl_res_str.replace(
+                '<%s>' % NO_TRANSLATE_TAG, '').replace('</%s>' % NO_TRANSLATE_TAG, '')
+            logger.debug('final translated string: %s', translated_str)
+            entry.msgstr = translated_str
+
+    logger.info(
+        'This script used %d caracters on your deepl account', deepl_char_count)
+    logger.info('Saving pofile')
+    pofileobj.save()
+
+    # To avoid this bug: https://github.com/izimobil/polib/issues/96
+    logger.info('Re-wrapping with msgcat...')
+    cmd = ['msgcat', str(pofile), '-o', str(pofile)]
+    logger.debug('cmd=%s', cmd)
+    subprocess.call(cmd)
+    logger.info('done.')
+
+
+if __name__ == '__main__':
+    usage = "deeplpoupdate <po_file> "
+    epilog = "Author: %s - Version: %s" % (__author__, __version__)
+    description = "This script translates a PO file using Translation "\
+                  "memory (TM) followed by an update via DeepL. " \
+                  "It requires a DeepL API key (free plan or paid plan). " \
+                  "The DeepL API key must be written in the file " \
+                  "~/.deepl_api_key.dat (same as the python polyglot lib). "\
+                  "It has been developped during the AEOdoo code sprint 2023 "\
+                  "in Valencia (Spain)."
+    parser = argparse.ArgumentParser(
+        usage=usage, epilog=epilog, description=description)
+    parser.add_argument(
+        '--from', dest='lang_from', default='EN',
+        help="Source language 2 letter code. EN (English) by default.")
+    parser.add_argument(
+        '--to', dest='lang_to', default='FR',
+        help="Destination language 2 letter code. FR (French) by default.")
+    parser.add_argument(
+        '-r', dest='glossary_refresh', action='store_true',
+        help="Delete and re-upload Deepl glossary.")
+    # TODO take into account filename
+    parser.add_argument(
+        '-l', '--log-level', dest='log_level', default='info',
+        help="Set log level. Possible values: debug, info, warn, error. "
+        "Default value: info.")
+    parser.add_argument("pofile", help="PO file to update")
+    args = parser.parse_args()
+    main(args)
