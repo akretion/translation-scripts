@@ -14,10 +14,11 @@ import csv
 import configparser
 from os.path import isfile
 from datetime import datetime
+from textwrap import shorten
 
 __author__ = "Alexis de Lattre <alexis.delattre@akretion.com>"
 __date__ = "June 2023"
-__version__ = "0.2"
+__version__ = "0.3"
 
 logger = logging.getLogger(__name__)
 FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
@@ -115,12 +116,12 @@ def get_deepl_api_key():
     return api_key
 
 
-def update_metadata(pofileobj, lang_to):
+def update_metadata(metadata, lang_to):
     # PO-Revision-Date YEAR-MO-DA HO:MI+ZONE
-    if not isinstance(pofileobj.metadata, dict):
+    if not isinstance(metadata, dict):
         return
     rev_date = datetime.utcnow().strftime('%Y-%m-%d %H:%M+0000')
-    pofileobj.metadata['PO-Revision-Date'] = rev_date
+    metadata['PO-Revision-Date'] = rev_date
 
     gitconfig_path = "%s/.gitconfig" % pathlib.Path.home()
     if not isfile(gitconfig_path):
@@ -134,12 +135,15 @@ def update_metadata(pofileobj, lang_to):
         if config.get('user', 'email'):
             name = '%s <%s>' % (name, config['user']['email'])
         if name:
-            pofileobj.metadata['Last-Translator'] = name
-    header_lang = pofileobj.metadata.get('Language')
+            metadata['Last-Translator'] = name
+    header_lang = metadata.get('Language')
     if not header_lang:
-        logger.warning('Missing Language in PO file header')
+        meta_lang = lang_to.lower()
+        metadata['Language'] = meta_lang
+        logger.info('Language in PO file header set to %s (was not set)', meta_lang)
     elif header_lang.upper() != lang_to:
-        logger.warning('The Language set in the PO file header is %s', header_lang)
+        logger.error('The Language set in the PO file header is %s', header_lang)
+        sys.exit(1)
 
 
 def main(args):
@@ -172,9 +176,10 @@ def main(args):
         sys.exit(1)
     lang_from = args.lang_from.upper()
     lang_to = args.lang_to.upper()
-    logger.info('Starting to update %s', pofile)
+    logger.info('Starting to update %s from %s to %s', pofile, lang_from, lang_to)
     translator = deepl.Translator(get_deepl_api_key())
     pofileobj = polib.pofile(pofile)
+    update_metadata(pofileobj.metadata, lang_to)
 
     glo_obj = get_deepl_glossary_object(translator)
     if glo_obj and args.glossary_refresh:
@@ -201,10 +206,12 @@ def main(args):
         logger.debug('msgid=%s msgstr=%s', entry.msgid, entry.msgstr)
         if entry.msgid in tmmap:
             msgstr = tmmap[entry.msgid]
-            logger.info('Translation memory: %s -> %s', entry.msgid, msgstr)
-            entry.msgstr = tmmap[entry.msgid]
-        elif not entry.msgstr:
-            logger.info("Deepl request")
+            if not entry.msgstr or entry.msgstr != msgstr:
+                logger.info(
+                    'Translation memory: %s -> %s (was %s)',
+                    entry.msgid, msgstr, entry.msgstr or '-')
+                entry.msgstr = tmmap[entry.msgid]
+        elif not entry.msgstr or entry.fuzzy:
             # preserve_formatting is False by default -> set it to True
             # It will still update the formatting for punctuation
             tag_handling = 'xml'
@@ -222,7 +229,8 @@ def main(args):
             # To avoid translating %(company)s, we encapsulate with <keep>
             pattern = r'%(\(\w*?\))?[sd]'
             source_deepl_str = re.sub(pattern, insert_keep, entry.msgid)
-            logger.debug('Source string sent to deepl: %s', source_deepl_str)
+            logger.info("Deepl request on %s", shorten(source_deepl_str, 50))
+            logger.debug('Full source string sent to deepl: %s', source_deepl_str)
             # https://support.deepl.com/hc/en-us/articles/360020685720-DeepL-API-Character-count-and-billing
             # One character corresponds to one unicode code point
             # Invisible characters such as spaces, tabs, line feeds, etc.,
@@ -244,10 +252,11 @@ def main(args):
                 '<%s>' % NO_TRANSLATE_TAG, '').replace('</%s>' % NO_TRANSLATE_TAG, '')
             logger.debug('final translated string: %s', translated_str)
             entry.msgstr = translated_str
+            if entry.fuzzy:
+                entry.flags.remove('fuzzy')
 
     logger.info(
         'This script used %d caracters on your deepl account', deepl_char_count)
-    update_metadata(pofileobj, lang_to)
     logger.info('Saving pofile')
     pofileobj.save()
 
