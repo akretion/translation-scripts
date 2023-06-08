@@ -11,11 +11,13 @@ import sys
 import pathlib
 import requests
 import csv
+import configparser
 from os.path import isfile
+from datetime import datetime
 
 __author__ = "Alexis de Lattre <alexis.delattre@akretion.com>"
 __date__ = "June 2023"
-__version__ = "0.1"
+__version__ = "0.2"
 
 logger = logging.getLogger(__name__)
 FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
@@ -113,6 +115,33 @@ def get_deepl_api_key():
     return api_key
 
 
+def update_metadata(pofileobj, lang_to):
+    # PO-Revision-Date YEAR-MO-DA HO:MI+ZONE
+    if not isinstance(pofileobj.metadata, dict):
+        return
+    rev_date = datetime.utcnow().strftime('%Y-%m-%d %H:%M+0000')
+    pofileobj.metadata['PO-Revision-Date'] = rev_date
+
+    gitconfig_path = "%s/.gitconfig" % pathlib.Path.home()
+    if not isfile(gitconfig_path):
+        logger.debug('No gitconfig file %s', gitconfig_path)
+        return
+    config = configparser.ConfigParser()
+    config.read(gitconfig_path)
+    name = False
+    if config.get('user', 'name'):
+        name = config['user']['name']
+        if config.get('user', 'email'):
+            name = '%s <%s>' % (name, config['user']['email'])
+        if name:
+            pofileobj.metadata['Last-Translator'] = name
+    header_lang = pofileobj.metadata.get('Language')
+    if not header_lang:
+        logger.warning('Missing Language in PO file header')
+    elif header_lang.upper() != lang_to:
+        logger.warning('The Language set in the PO file header is %s', header_lang)
+
+
 def main(args):
 
     if args.log_level:
@@ -135,11 +164,17 @@ def main(args):
     if not isfile(pofile):
         logger.error('File not found: %s', pofile)
         sys.exit(1)
-    logger.info('Starting to update %s', pofile)
-    translator = deepl.Translator(get_deepl_api_key())
-    pofileobj = polib.pofile(args.pofile)
+    if len(args.lang_from) != 2:
+        logger.error('Source language (%s) must be a 2 letter code', args.lang_from)
+        sys.exit(1)
+    if len(args.lang_to) != 2:
+        logger.error('Destination language (%s) must be a 2 letter code', args.lang_to)
+        sys.exit(1)
     lang_from = args.lang_from.upper()
     lang_to = args.lang_to.upper()
+    logger.info('Starting to update %s', pofile)
+    translator = deepl.Translator(get_deepl_api_key())
+    pofileobj = polib.pofile(pofile)
 
     glo_obj = get_deepl_glossary_object(translator)
     if glo_obj and args.glossary_refresh:
@@ -212,6 +247,7 @@ def main(args):
 
     logger.info(
         'This script used %d caracters on your deepl account', deepl_char_count)
+    update_metadata(pofileobj, lang_to)
     logger.info('Saving pofile')
     pofileobj.save()
 
