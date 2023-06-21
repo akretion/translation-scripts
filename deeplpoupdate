@@ -18,7 +18,7 @@ from textwrap import shorten
 
 __author__ = "Alexis de Lattre <alexis.delattre@akretion.com>"
 __date__ = "June 2023"
-__version__ = "0.4"
+__version__ = "0.5"
 
 logger = logging.getLogger(__name__)
 FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
@@ -225,9 +225,15 @@ def main(args):
                     reference = entry.occurrences[0]
                 if reference and reference.startswith('model:mail.template,body_html'):
                     tag_handling = 'html'
-            # To avoid translating %(company)s, we encapsulate with <keep>
+            # To avoid translating %(company)s, we encapsulate with <NO_TRANSLATE_TAG>
             pattern = r'%(\(\w*?\))?[sd]'
             source_deepl_str = re.sub(pattern, insert_keep, entry.msgid)
+            # Avoid translating {{object.partner_id.id}} as used in several fields
+            # of mail.template: subject, email_from, partner_to, lang, ...
+            if '{{' in source_deepl_str and '}}' in source_deepl_str:
+                source_deepl_str = source_deepl_str.replace(
+                    '{{', '<%s>{{' % NO_TRANSLATE_TAG).replace(
+                        '}}', '}}</%s>' % NO_TRANSLATE_TAG)
             logger.info("Deepl request on %s", shorten(source_deepl_str, 50))
             logger.debug('Full source string sent to deepl: %s', source_deepl_str)
             # https://support.deepl.com/hc/en-us/articles/360020685720-DeepL-API-Character-count-and-billing
