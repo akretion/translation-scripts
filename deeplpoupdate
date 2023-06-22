@@ -14,6 +14,7 @@ import csv
 import configparser
 from os.path import isfile
 from datetime import datetime
+import pytz
 from textwrap import shorten
 
 __author__ = "Alexis de Lattre <alexis.delattre@akretion.com>"
@@ -28,6 +29,7 @@ DEEPL_GLOSSARY_NAME = 'odoo_fr_glossary'
 GDOC_URL = "https://docs.google.com/spreadsheets/d/1EacGeRFECVt6v9B4H7l5EUEDjefNeyGRicqouJ6P5mM/export"
 TM_TAB = 0
 GLOSSARY_TAB = 2121742205
+GDOC_TZ = 'Europe/Paris'
 # We use a very small NO_TRANSLATE_TAG to save money
 # because Deepl counts it in the char count !
 NO_TRANSLATE_TAG = 'z'
@@ -44,29 +46,32 @@ def _get_google_doc_dict(url, tab, lang_from, lang_to):
         sys.exit(1)
     csvcontent = r.content
     csvstr = csvcontent.decode('utf8')
-    res = {}
+    res = {'map': {}, 'write_date': False}
     for item in csv.DictReader(csvstr.splitlines()):
-        if item and item.get(lang_from) and item.get(lang_to):
+        if item.get('Section') == 'write_date' and item.get(lang_from):
+            write_date = item[lang_from]
+            try:
+                datetime_naive = datetime.strptime(write_date, '%d/%m/%Y %H:%M:%S')
+                gdoc_tz = pytz.timezone(GDOC_TZ)
+                res['write_date'] = gdoc_tz.localize(datetime_naive)
+            except:
+                continue
+        elif item and item.get(lang_from) and item.get(lang_to):
             from_str = item[lang_from].strip()
             to_str = item[lang_to].strip()
             if from_str and to_str:
-                res[from_str] = to_str
+                res['map'][from_str] = to_str
     logger.debug('res=%s', res)
     return res
 
 
-def set_deepl_glossary(lang_from, lang_to, translator):
-    logger.info('Downloading Glossary Google doc')
-    glossary = _get_google_doc_dict(GDOC_URL, GLOSSARY_TAB, lang_from, lang_to)
-    if not glossary:
-        logger.error('Failed to parse the glossary tab of the Google doc')
-        sys.exit(1)
+def set_deepl_glossary(lang_from, lang_to, translator, gdoc_glossary):
     logger.info('Creating deepl glossary...')
     res = translator.create_glossary(
         DEEPL_GLOSSARY_NAME,
         source_lang=lang_from,
         target_lang=lang_to,
-        entries=glossary)
+        entries=gdoc_glossary['map'])
     logger.debug('Deepl glossary successfully created ID %s', res.glossary_id)
     return res
 
@@ -76,6 +81,7 @@ def get_deepl_glossary_object(translator):
     glossaries = translator.list_glossaries()
     res = False
     for glossary in glossaries:
+        logger.debug('glossary=%s creation_time=%s', glossary.name, glossary.creation_time)
         if glossary.name == DEEPL_GLOSSARY_NAME:
             if res:
                 logger.warning(
@@ -97,7 +103,10 @@ def get_translation_memory_dict(lang_from, lang_to):
     if not tmmap:
         logger.error('Failed to parse Translation Memory Google doc')
         sys.exit(1)
-    return tmmap
+    if not tmmap.get('map'):
+        logger.error('The Translation Memory tab of the Google doc is empty')
+        sys.exit(1)
+    return tmmap['map']
 
 
 def insert_keep(matchobj):
@@ -181,14 +190,29 @@ def main(args):
     pofileobj = polib.pofile(pofile)
     update_metadata(pofileobj.metadata, lang_to)
 
+    logger.info('Downloading Google doc Glossary')
+    gdoc_glossary = _get_google_doc_dict(GDOC_URL, GLOSSARY_TAB, lang_from, lang_to)
+    if not gdoc_glossary:
+        logger.error('Failed to parse the glossary tab of the Google doc')
+        sys.exit(1)
+    if not gdoc_glossary.get('map'):
+        logger.error('The glossary tab of the Google doc is empty')
+        sys.exit(1)
+
     glo_obj = get_deepl_glossary_object(translator)
-    if glo_obj and args.glossary_refresh:
-        logger.info(
-            'Deleting glossary %s ID %s', DEEPL_GLOSSARY_NAME, glo_obj.glossary_id)
-        translator.delete_glossary(glo_obj)
-        glo_obj = False
+    if glo_obj:
+        # compare last modification date
+        logger.info('Deepl glossary create date %s <-> Gdoc glossary %s', glo_obj.creation_time, gdoc_glossary['write_date'])
+        if gdoc_glossary['write_date'] and gdoc_glossary['write_date'] > glo_obj.creation_time:
+            logger.info('Google doc last write date is more recent than the existing deepl glossary create date')
+            logger.info(
+                'Deleting glossary %s ID %s', DEEPL_GLOSSARY_NAME, glo_obj.glossary_id)
+            translator.delete_glossary(glo_obj)
+            glo_obj = False
+        else:
+            logger.info('Existing Deepl glossary %s is up-to-date', DEEPL_GLOSSARY_NAME)
     if not glo_obj:
-        glo_obj = set_deepl_glossary(lang_from, lang_to, translator)
+        glo_obj = set_deepl_glossary(lang_from, lang_to, translator, gdoc_glossary)
     # check glossary is ready
     if glo_obj.ready:
         logger.info('Glossary is in ready state')
@@ -291,9 +315,6 @@ if __name__ == '__main__':
     parser.add_argument(
         '--to', dest='lang_to', default='FR',
         help="Destination language 2 letter code. FR (French) by default.")
-    parser.add_argument(
-        '-r', dest='glossary_refresh', action='store_true',
-        help="Delete and re-upload Deepl glossary.")
     # TODO take into account filename
     parser.add_argument(
         '-l', '--log-level', dest='log_level', default='info',
