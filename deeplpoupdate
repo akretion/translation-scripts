@@ -1,4 +1,4 @@
-#! /usr/bin/python3
+#!/usr/bin/env python
 # Copyright 2023 Akretion France <https://www.akretion.com/>
 
 import argparse
