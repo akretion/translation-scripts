@@ -236,6 +236,8 @@ def main(args):
                     'Translation memory: %s -> %s (was %s)',
                     entry.msgid, msgstr, entry.msgstr or '-')
                 entry.msgstr = tmmap[entry.msgid]
+            if entry.fuzzy:
+                entry.flags.remove('fuzzy')
         elif not entry.msgstr or entry.fuzzy:
             # preserve_formatting is False by default -> set it to True
             # It will still update the formatting for punctuation
